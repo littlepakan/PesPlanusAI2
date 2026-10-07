@@ -4,7 +4,5 @@ python-multipart
 torch
 torchvision
 numpy==2.5.1
-scikit-learn==1.9.0
 pillow
 pandas
-opencv-python-headless
