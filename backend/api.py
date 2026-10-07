@@ -2,26 +2,24 @@ import asyncio
 import gc
 import io
 import os
-import pickle
+import urllib.request
 from typing import Optional
 
 import cv2
-import joblib
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageFile
 import torch
 import torch.nn as nn
-from torchvision import models, transforms
+from torchvision import transforms
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-# ป้องกัน Error รูปภาพสูญหายหรือถูกตัดทอน
-ImageFile.LOAD_TRUNCATED_IMAGES = True 
+# ป้องกันปัญหาภาพ X-ray ขาดท่อน
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-app = FastAPI(title="Pes Planus AI API")
+app = FastAPI(title="Pes Planus AI API (DenseNet-201 Ensemble)")
 
-# --- ตั้งค่า CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,20 +30,48 @@ app.add_middleware(
 
 @app.get("/")
 def read_root():
-    return {"message": "Pes Planus API is running perfectly!"}
+    return {"message": "Pes Planus DenseNet201 API is running perfectly!"}
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 📌 กำหนดชื่อไฟล์โมเดลที่วางอยู่บนเซิร์ฟเวอร์ (ต้องเอาไฟล์นี้มาวางคู่กับ api.py)
-MODEL_PATH = "model.pkl" 
+# 📌 ชื่อไฟล์โมเดล DenseNet-201 Ensemble (.pt)
+MODEL_PATH = "ens_arch_densenet201.pt"
+
+# 🌐 (ตัวเลือก) ใส่ Direct Link สำหรับดาวน์โหลดบน Render กรณีไม่ได้ push ไฟล์เข้า GitHub
+# เช่น ลิงก์จาก GitHub Release: "https://github.com/<user>/<repo>/releases/download/v1.0.0/ens_arch_densenet201.pt"
+MODEL_DOWNLOAD_URL = os.getenv("MODEL_DOWNLOAD_URL", "")
 
 model_lock = asyncio.Lock()
 global_state = {
-    "feature_extractor": None,
-    "ml_model": None,
+    "model": None,
     "csv_key": None,
     "gt_map": {},
 }
+
+def download_model_if_needed():
+    if not os.path.exists(MODEL_PATH):
+        if MODEL_DOWNLOAD_URL:
+            print(f"⏳ ไม่พบ {MODEL_PATH} กำลังดาวน์โหลดจาก URL...")
+            urllib.request.urlretrieve(MODEL_DOWNLOAD_URL, MODEL_PATH)
+            print("✅ ดาวน์โหลดโมเดลเรียบร้อยแล้ว!")
+        else:
+            raise FileNotFoundError(
+                f"ไม่พบไฟล์โมเดล '{MODEL_PATH}' ในโฟลเดอร์ และไม่มีการระบุ MODEL_DOWNLOAD_URL"
+            )
+
+def load_pt_model():
+    download_model_if_needed()
+    print("🧠 กำลังโหลด DenseNet-201 Ensemble เข้าสู่หน่วยความจำ...")
+    try:
+        # ลองโหลดแบบ PyTorch ปกติ
+        model = torch.load(MODEL_PATH, map_location=device, weights_only=False)
+    except Exception:
+        # Fallback กรณีเซฟมาแบบ TorchScript JIT
+        model = torch.jit.load(MODEL_PATH, map_location=device)
+    
+    if isinstance(model, nn.Module):
+        model.eval()
+    return model
 
 def parse_csv_dataframe(df: pd.DataFrame):
     df.columns = [str(c).strip().replace("\n", "").lower() for c in df.columns]
@@ -87,25 +113,15 @@ def apply_median_filter(img):
     median_img = cv2.medianBlur(img_cv, 3)
     return Image.fromarray(cv2.cvtColor(median_img, cv2.COLOR_BGR2RGB))
 
+# DenseNet201 มาตรฐานใช้ขนาด 224x224
 def get_transforms():
     return transforms.Compose([
         transforms.Lambda(apply_median_filter),
-        transforms.Resize((227, 227)),
+        transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-class SqueezeNetExtractor(nn.Module):
-    def __init__(self):
-        super().__init__()
-        orig = models.squeezenet1_1(weights=models.SqueezeNet1_1_Weights.DEFAULT)
-        self.features = orig.features
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-
-    def forward(self, x):
-        return torch.flatten(self.pool(self.features(x)), 1)
-
-# 🟢 Endpoint สำหรับรับภาพมาวิเคราะห์
 @app.post("/api/predict")
 async def predict_single_image(
     file: UploadFile = File(...),
@@ -114,25 +130,14 @@ async def predict_single_image(
 ):
     try:
         async with model_lock:
-            # 1. โหลด ML Model จากไฟล์ในเซิร์ฟเวอร์ (ถ้ายังไม่ได้โหลด)
-            if global_state["ml_model"] is None:
-                if not os.path.exists(MODEL_PATH):
-                    raise HTTPException(status_code=500, detail=f"ไม่พบไฟล์โมเดล '{MODEL_PATH}' บนเซิร์ฟเวอร์ กรุณาตรวจสอบว่ามีไฟล์นี้อยู่คู่กับ api.py")
+            # 1. โหลดโมเดล DenseNet-201 Ensemble (โหลดเพียงครั้งเดียวตอนเริ่ม)
+            if global_state["model"] is None:
                 try:
-                    global_state["ml_model"] = joblib.load(MODEL_PATH)
-                except Exception:
-                    try:
-                        with open(MODEL_PATH, "rb") as f:
-                            global_state["ml_model"] = pickle.load(f)
-                    except Exception as e:
-                        raise HTTPException(status_code=500, detail=f"ไฟล์ Model (.pkl) เสียหาย: {str(e)}")
+                    global_state["model"] = load_pt_model()
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"เกิดข้อผิดพลาดในการโหลดไฟล์โมเดล: {str(e)}")
 
-            # 2. โหลด Feature Extractor (ถ้ายังไม่ได้โหลด)
-            if global_state["feature_extractor"] is None:
-                feat_ext = SqueezeNetExtractor()
-                global_state["feature_extractor"] = feat_ext.to(device).eval()
-
-            # 3. จัดการไฟล์ CSV (ถ้าอัปโหลดมา)
+            # 2. จัดการไฟล์เฉลย CSV (ถ้ามี)
             if gt_option == "upload" and csv_file:
                 if global_state["csv_key"] != f"upload_{csv_file.filename}":
                     df_gt = pd.read_csv(io.BytesIO(await csv_file.read()))
@@ -142,33 +147,31 @@ async def predict_single_image(
                 global_state["gt_map"] = {}
                 global_state["csv_key"] = "none"
 
+        # 3. เตรียมรูปภาพ
         contents = await file.read()
         image = Image.open(io.BytesIO(contents)).convert("RGB")
         img_tensor = get_transforms()(image).unsqueeze(0).to(device)
 
+        # 4. ทำนายผลด้วยโมเดล Ensemble
+        model = global_state["model"]
         with torch.no_grad():
-            features = global_state["feature_extractor"](img_tensor).cpu().numpy()
+            output = model(img_tensor)
 
-        ml_model = global_state["ml_model"]
+            # ตรวจสอบรูปแบบ Output ของโมเดล
+            if isinstance(output, tuple):
+                output = output[0]
 
-        prediction_result = int(ml_model.predict(features)[0])
-        prob = float(prediction_result)
+            # แปลง Logits เป็น Probability ด้วย Softmax (หรือ Sigmoid ถ้า output มี node เดียว)
+            if output.shape[-1] == 1:
+                prob_raw = torch.sigmoid(output).item()
+                prediction_result = 1 if prob_raw >= 0.5 else 0
+                prob = prob_raw if prediction_result == 1 else (1 - prob_raw)
+            else:
+                probs = torch.softmax(output, dim=1).cpu().numpy()[0]
+                prediction_result = int(np.argmax(probs))
+                prob = float(probs[prediction_result])
 
-        # --- คำนวณค่าความมั่นใจ (Confidence Score) ---
-        prob = 0.0
-        if hasattr(ml_model, "predict_proba"):
-            try:
-                prob = float(ml_model.predict_proba(features)[0][1])
-            except Exception:
-                # กรณีโมเดลไม่มีค่าความมั่นใจให้ดึง จะคืนค่าตามผลลัพธ์ (0.0 หรือ 1.0)
-                prob = float(prediction_result)
-        elif hasattr(ml_model, "decision_function"):
-            # สำหรับโมเดลตระกูล SVM บางตัวที่ไม่ได้เปิดโหมด probability=True
-            df_val = ml_model.decision_function(features)[0]
-            prob = float(1 / (1 + np.exp(-df_val)))
-        else:
-            prob = float(prediction_result)
-
+        # 5. ตรวจสอบ Ground Truth
         fname = str(file.filename).strip().lower()
         bname = os.path.splitext(fname)[0]
         gt_label = global_state["gt_map"].get(fname) or global_state["gt_map"].get(bname)
@@ -194,7 +197,8 @@ async def predict_single_image(
             "eval_status": eval_status,
         }
 
-        del img_tensor, features
+        # เคลียร์ Memory ป้องกัน RAM บวม
+        del img_tensor, output
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
