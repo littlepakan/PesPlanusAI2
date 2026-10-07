@@ -30,7 +30,7 @@ export default function Home() {
   const [fullscreenImage, setFullscreenImage] = useState<string | null>(null);
   const [theme, setTheme] = useState<"light" | "dark" | "system">("system");
 
-  const API_BASE_URL = "https://pesplanusai.onrender.com";
+  const API_BASE_URL = "https://pesplanusai2.onrender.com";
 
   // ข้อมูลผู้จัดทำ 3 คน
   const developers = [
