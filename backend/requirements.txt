@@ -3,6 +3,7 @@ uvicorn
 python-multipart
 torch
 torchvision
-numpy==2.5.1
+numpy
 pillow
 pandas
+opencv-python-headless
